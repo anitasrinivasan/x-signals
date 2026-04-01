@@ -68,6 +68,20 @@ When answering:
 - Be direct about what the corpus does and doesn't contain
 - For writing pitches, be specific: a real thesis, not just a topic area"""
 
+OPUS_PITCH_SYSTEM = """You are writing notes for yourself. You are a legal/policy analyst — you publish rigorous, opinionated analysis at law review companions, Tech Policy Press, Lawfare, and Substack. Your writing is direct, argues a specific position, and trusts the reader. You use "I" naturally.
+
+You've just finished scanning your bookmark corpus and you want to capture what you'd actually pitch to an editor this week. Write as if you're jotting urgent notes — specific, grounded, impatient with vagueness.
+
+Not: "Scholars have debated whether X..."
+But: "The thing I want to say about X is Y, and this week is the moment because Z."
+
+Venue shorthand: LR = law review companion | TPP = Tech Policy Press | LF = Lawfare | Sub = Substack | Thread = X thread
+
+Format each pitch as:
+**[Headline]** → [Venue]
+[2-3 sentences of why this, why now, what the argument actually is]
+Sources: [2-3 @handles with their specific claims]"""
+
 WHAT_TO_WRITE_PROMPT = """Analyze my bookmark corpus to surface what I should write next.
 
 Start by calling query_narratives to get the narrative landscape:
@@ -96,6 +110,57 @@ def load_env():
                 if line and not line.startswith("#") and "=" in line:
                     key, _, value = line.partition("=")
                     os.environ[key.strip()] = value.strip()
+
+
+def send_telegram(text):
+    """Send a Telegram message if credentials are configured."""
+    token   = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        return
+    try:
+        import urllib.request, urllib.parse
+        payload = json.dumps({"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}).encode()
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=10)
+    except Exception:
+        pass  # Telegram is best-effort; don't surface errors in the UI
+
+
+def save_pitches(text):
+    """Save pitch text to ~/x-signals/pitches/YYYY-MM-DD.md. Returns file path."""
+    pitches_dir = SCRIPT_DIR / "pitches"
+    pitches_dir.mkdir(exist_ok=True)
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    path = pitches_dir / f"{date_str}.md"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def format_pitch_telegram(text, date_str):
+    """Extract first 2 pitch blocks for Telegram preview."""
+    lines = text.strip().splitlines()
+    previews = []
+    current = []
+    for line in lines:
+        if line.startswith("**") and current:
+            previews.append("\n".join(current).strip())
+            current = [line]
+            if len(previews) >= 2:
+                break
+        else:
+            current.append(line)
+    if current and len(previews) < 2:
+        previews.append("\n".join(current).strip())
+
+    body = "\n\n".join(p[:300] for p in previews[:2])
+    total = text.count("\n**")  # rough pitch count
+    more = f"\n\n[+{max(0, total - 2)} more pitches saved locally]" if total > 2 else ""
+    return f"📝 *x-signals pitches — {date_str}*\n\n{body}{more}"
 
 
 def get_conn():
@@ -278,13 +343,38 @@ def narrative_graph_tab():
                 "barnesHut": {"gravitationalConstant": -8000, "springLength": 120},
             },
             "edges": {"smooth": {"type": "continuous"}},
-            "interaction": {"hover": True, "tooltipDelay": 100},
+            "interaction": {
+                "hover":        True,
+                "tooltipDelay": 100,
+                "zoomView":     True,
+                "dragView":     True,
+                "minZoom":      0.15,
+                "maxZoom":      3.0,
+                "navigationButtons": True,
+            },
         }))
 
         with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w") as f:
             net.save_graph(f.name)
             html = open(f.name).read()
-        st.components.v1.html(html, height=620, scrolling=False)
+
+        # Inject graph control buttons directly into the pyvis iframe HTML
+        btn_style = (
+            "background:#1e293b;color:#e2e8f0;border:1px solid #334155;"
+            "border-radius:6px;padding:5px 12px;margin:2px;cursor:pointer;"
+            "font-size:12px;font-family:sans-serif;"
+        )
+        controls_html = f"""
+<div id="graph-controls" style="position:absolute;top:8px;right:8px;z-index:1000;display:flex;gap:4px;">
+  <button style="{btn_style}" onclick="network.fit()">⊙ Reset view</button>
+  <button style="{btn_style}" id="btn-physics"
+    onclick="if(window._physicsOn){{network.stopSimulation();this.textContent='▶ Physics';window._physicsOn=false;}}else{{network.startSimulation();this.textContent='⏸ Freeze';window._physicsOn=true;}}">⏸ Freeze</button>
+</div>
+<script>window._physicsOn = true;</script>
+"""
+        # Inject before </body>
+        html = html.replace("</body>", controls_html + "\n</body>")
+        st.components.v1.html(html, height=640, scrolling=False)
 
     except ImportError:
         st.error("pyvis/networkx not installed. Run: `pip install pyvis networkx`")
@@ -551,6 +641,17 @@ def writing_assistant_tab():
     if not user_input:
         return
 
+    # Telegram notify option (only for What to Write Next)
+    notify_mode = False
+    if mode == "💡 What to Write Next":
+        tg_ready = bool(os.environ.get("TELEGRAM_BOT_TOKEN"))
+        notify_mode = st.checkbox(
+            "🔔 Send to Telegram when done",
+            value=tg_ready,
+            disabled=not tg_ready,
+            help="Requires TELEGRAM_BOT_TOKEN in .env" if not tg_ready else "",
+        )
+
     # Tools for the agentic loop
     query_db_tool = {
         "name": "query_db",
@@ -608,13 +709,15 @@ def writing_assistant_tab():
     tools = [query_narratives_tool, query_db_tool] if has_narratives else [query_db_tool]
 
     messages = [{"role": "user", "content": user_input}]
+    is_pitch_mode = (mode == "💡 What to Write Next")
 
+    # ── Phase 1: Sonnet + tools (research) ───────────────────────────────────
     with st.spinner("Researching your corpus…"):
-        response_placeholder = st.empty()
-        query_log = []
-        final_text = ""
+        research_placeholder = st.empty()
+        query_log  = []
+        research_brief = ""  # accumulated Sonnet text (used as context for Opus)
 
-        for iteration in range(10):  # max agentic iterations
+        for iteration in range(10):
             response = client.messages.create(
                 model="claude-sonnet-4-5",
                 max_tokens=4096,
@@ -623,8 +726,7 @@ def writing_assistant_tab():
                 messages=messages,
             )
 
-            # Process response content
-            tool_calls = []
+            tool_calls  = []
             text_blocks = []
             for block in response.content:
                 if block.type == "text":
@@ -633,18 +735,19 @@ def writing_assistant_tab():
                     tool_calls.append(block)
 
             if text_blocks:
-                final_text = "\n\n".join(text_blocks)
-                response_placeholder.markdown(final_text)
+                research_brief = "\n\n".join(text_blocks)
+                if not is_pitch_mode:
+                    # For non-pitch modes, render Sonnet output directly
+                    research_placeholder.markdown(research_brief)
 
             if response.stop_reason == "end_turn" or not tool_calls:
                 break
 
-            # Execute tool calls
             messages.append({"role": "assistant", "content": response.content})
             tool_results = []
 
             for tool_call in tool_calls:
-                sql = tool_call.input.get("sql", "")
+                sql       = tool_call.input.get("sql", "")
                 tool_name = tool_call.name
                 query_log.append(f"[{tool_name}] {sql}")
 
@@ -653,50 +756,88 @@ def writing_assistant_tab():
                 else:
                     try:
                         rows = run_query(sql)
-
                         if tool_name == "query_narratives":
-                            # Narrative rows are already compact — pass through as-is, cap at 30
                             slimmed = [dict(r) for r in rows[:30]]
                         else:
-                            # Slim bookmark rows to key fields, truncate long text
                             def slim(r):
                                 return {
-                                    "id": r.get("id"),
-                                    "author": r.get("author_handle"),
-                                    "created_at": (r.get("created_at") or "")[:10],
-                                    "summary": (r.get("summary") or "")[:200],
-                                    "core_claim": (r.get("core_claim") or "")[:150],
-                                    "topics": r.get("topics"),
-                                    "subtopics": r.get("subtopics"),
+                                    "id":           r.get("id"),
+                                    "author":       r.get("author_handle"),
+                                    "created_at":   (r.get("created_at") or "")[:10],
+                                    "summary":      (r.get("summary") or "")[:200],
+                                    "core_claim":   (r.get("core_claim") or "")[:150],
+                                    "topics":       r.get("topics"),
+                                    "subtopics":    r.get("subtopics"),
                                     "content_type": r.get("content_type"),
-                                    "authority": r.get("authority"),
-                                    "position": r.get("position"),
-                                    "text": (r.get("text") or "")[:200],
-                                    "likes": r.get("likes"),
-                                    "views": r.get("views"),
+                                    "authority":    r.get("authority"),
+                                    "position":     r.get("position"),
+                                    "text":         (r.get("text") or "")[:200],
+                                    "likes":        r.get("likes"),
+                                    "views":        r.get("views"),
                                 }
                             slimmed = [slim(r) for r in rows[:20]]
-
-                        result_content = json.dumps({
-                            "total_matched": len(rows),
-                            "returned": len(slimmed),
-                            "rows": slimmed,
-                        }, default=str)
+                        result_content = json.dumps(
+                            {"total_matched": len(rows), "returned": len(slimmed), "rows": slimmed},
+                            default=str,
+                        )
                     except Exception as e:
                         result_content = json.dumps({"error": str(e)})
 
                 tool_results.append({
-                    "type": "tool_result",
+                    "type":        "tool_result",
                     "tool_use_id": tool_call.id,
-                    "content": result_content,
+                    "content":     result_content,
                 })
 
             messages.append({"role": "user", "content": tool_results})
 
-    # Show final response
+    # ── Phase 2 (pitch mode only): Opus writes the final pitches ─────────────
+    final_text = research_brief  # default: use Sonnet output as-is
+
+    if is_pitch_mode and research_brief:
+        research_placeholder.empty()  # clear the interim Sonnet text
+        with st.spinner("Writing pitches…"):
+            opus_prompt = (
+                "Here is research gathered from my bookmark corpus:\n\n"
+                f"{research_brief}\n\n"
+                "Now write the pitches."
+            )
+            try:
+                opus_response = client.messages.create(
+                    model="claude-opus-4-5",
+                    max_tokens=2048,
+                    system=OPUS_PITCH_SYSTEM,
+                    messages=[{"role": "user", "content": opus_prompt}],
+                )
+                final_text = opus_response.content[0].text
+            except Exception as e:
+                # Fall back to Sonnet output if Opus fails
+                final_text = research_brief
+                st.warning(f"Opus unavailable ({e}), showing Sonnet draft instead.")
+
+    # ── Render output ─────────────────────────────────────────────────────────
     if final_text:
         st.markdown("---")
         st.markdown(final_text)
+
+        # Export button
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        st.download_button(
+            "⬇ Download as Markdown",
+            data=final_text,
+            file_name=f"pitches-{date_str}.md" if is_pitch_mode else f"x-signals-{date_str}.md",
+            mime="text/markdown",
+        )
+
+        # Save + Telegram notification (pitch mode only)
+        if is_pitch_mode:
+            save_pitches(final_text)
+            if notify_mode:
+                tg_msg = format_pitch_telegram(final_text, date_str)
+                send_telegram(tg_msg)
+                st.success("✅ Pitches saved and sent to Telegram.")
+            else:
+                st.caption(f"💾 Saved to pitches/{date_str}.md")
 
     # Show SQL queries in collapsible
     if query_log:
@@ -720,9 +861,26 @@ def main():
     load_env()
 
     if not DB_PATH.exists():
-        st.error(
-            "Database not found. Run: `python3 db.py` to initialise, then `python3 enrich.py` to enrich."
+        # First-run onboarding
+        st.title("👋 Welcome to x-signals")
+        st.markdown(
+            "Your database hasn't been set up yet. "
+            "Run the setup script to get started:"
         )
+        st.code("./setup.sh", language="bash")
+        st.markdown("**Or manually:**")
+        st.code(
+            "cp .env.example .env   # fill in your keys\n"
+            "python3 sync_bookmarks.py --full\n"
+            "python3 enrich.py\n"
+            "python3 cluster.py\n"
+            "streamlit run app.py",
+            language="bash",
+        )
+        missing = [k for k in ("ANTHROPIC_API_KEY", "TWITTER_AUTH_TOKEN", "TWITTER_CT0")
+                   if not os.environ.get(k)]
+        if missing:
+            st.warning(f"Missing in .env: {', '.join(missing)}")
         return
 
     # Check enrichment status

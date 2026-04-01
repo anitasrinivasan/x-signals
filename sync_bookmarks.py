@@ -160,7 +160,8 @@ def sync(batch_size):
     merged = existing_list + new_dicts
     save_master(merged)
 
-    # Upsert new rows into SQLite and enrich them
+    # Upsert new rows into SQLite, enrich, and cluster
+    cluster_stats = {}
     try:
         from db import get_conn, init_db, import_from_json
         from enrich import enrich_new
@@ -172,11 +173,22 @@ def sync(batch_size):
         db_conn.close()
         enrich_new(new_ids=[d["id"] for d in new_dicts], verbose=True)
         from cluster import cluster_new
-        cluster_new(new_ids=[d["id"] for d in new_dicts])
+        cluster_stats = cluster_new(new_ids=[d["id"] for d in new_dicts]) or {}
     except Exception as e:
         print(f"[warn] DB/enrichment step failed: {e}", file=sys.stderr)
 
-    msg = f"✅ x-signals: +{len(new_dicts)} new bookmarks (total: {len(merged)}) — {today}"
+    # Build Telegram message
+    lines = [f"✅ x-signals: +{len(new_dicts)} new bookmarks (total: {len(merged)}) — {today}"]
+    if cluster_stats:
+        assigned   = cluster_stats.get("assigned", 0)
+        unassigned = cluster_stats.get("unassigned", 0)
+        lines.append(f"   📚 Enriched: {len(new_dicts)} · Clustered: {assigned} into narratives"
+                     + (f" ({unassigned} unclustered)" if unassigned else ""))
+        for title, delta in cluster_stats.get("top_heating", []):
+            short = title[:50] + "…" if len(title) > 50 else title
+            lines.append(f"   ↑ {short} (+{delta})")
+
+    msg = "\n".join(lines)
     print(msg)
     send_telegram(telegram_token, telegram_chat, msg)
 

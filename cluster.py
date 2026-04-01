@@ -514,9 +514,21 @@ def cluster_all(conn=None, no_labels=False, since_days=None):
     n = write_to_db(conn, clusters, labels, by_id, eng_scores)
     print(f"Done. {n} narratives written to DB.")
 
+    # Gather top heating narratives for Telegram
+    top_heating = conn.execute(
+        """SELECT title, momentum_delta FROM narratives
+           WHERE momentum_delta > 0 AND title IS NOT NULL
+           ORDER BY momentum_delta DESC LIMIT 3"""
+    ).fetchall()
+    tweet_links = conn.execute("SELECT COUNT(*) FROM tweet_narratives").fetchone()[0]
+
     if close:
         conn.close()
-    return n
+    return {
+        "narratives": n,
+        "tweet_links": tweet_links,
+        "top_heating": [(r["title"], round(r["momentum_delta"], 3)) for r in top_heating],
+    }
 
 
 def cluster_new(new_ids, conn=None):
@@ -598,8 +610,25 @@ def cluster_new(new_ids, conn=None):
     conn.commit()
     print(f"cluster_new: assigned {assigned} of {len(new_ids)} new tweets to existing narratives.")
 
+    # Top narratives that gained new tweets this run
+    if assigned > 0:
+        top_heating = conn.execute(
+            """SELECT title, momentum_delta FROM narratives
+               WHERE momentum_delta > 0 AND title IS NOT NULL
+               ORDER BY momentum_delta DESC LIMIT 3"""
+        ).fetchall()
+        top_heating_list = [(r["title"], round(r["momentum_delta"], 3)) for r in top_heating]
+    else:
+        top_heating_list = []
+
     if close:
         conn.close()
+
+    return {
+        "assigned":   assigned,
+        "unassigned": max(0, len(new_ids) - assigned),
+        "top_heating": top_heating_list,
+    }
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
