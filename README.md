@@ -27,43 +27,26 @@ The core idea: rather than treating bookmarks as a flat archive to search, x-sig
 - Anthropic API key
 - Telegram bot token (optional, for nightly notifications)
 
-### Install
+### Quickstart
 
 ```bash
 git clone https://github.com/anitasrinivasan/x-signals.git
 cd x-signals
-pip install -r requirements.txt
+./setup.sh
 ```
 
-### Configure `.env`
+`setup.sh` handles everything: virtualenv, dependencies, credential prompts, first-time pipeline, and scheduler installation. See the [Deployment](#deployment) section for details on Mac Mini, Docker, and VPS options.
 
-```
-TWITTER_AUTH_TOKEN=your_auth_token
-TWITTER_CT0=your_ct0_cookie
-ANTHROPIC_API_KEY=your_key
-TELEGRAM_BOT_TOKEN=your_bot_token   # optional
-TELEGRAM_CHAT_ID=your_chat_id       # optional
-```
-
-Get `auth_token` and `ct0` from your browser's cookies while logged into X.com.
-
-### First run
+### Manual install (if you prefer step-by-step)
 
 ```bash
-# 1. Initialise DB and import bookmarks from JSON
-python3 db.py
+pip install -r requirements.txt
+cp .env.example .env   # fill in your credentials
 
-# 2. Fetch bookmarks (requires twitter-cli config — see below)
-python3 sync_bookmarks.py --full
-
-# 3. Enrich all bookmarks with Claude Sonnet
-python3 enrich.py
-
-# 4. Cluster into narratives
-python3 cluster.py
-
-# 5. Launch the app
-streamlit run app.py
+python3 sync_bookmarks.py --full   # fetch bookmarks
+python3 enrich.py                  # enrich with Claude (~2-4h for large corpus)
+python3 cluster.py                 # build narrative clusters
+streamlit run app.py               # launch app
 ```
 
 ### twitter-cli config
@@ -80,17 +63,82 @@ And patch the absolute cap (twitter-cli defaults to 500 max):
 
 ---
 
-## Daily sync (launchd)
+## Deployment
 
-A launchd agent runs the sync at 23:00 nightly. Install:
+### Option A — Local machine (macOS / Linux)
 
 ```bash
-# Copy the plist to LaunchAgents (update paths as needed)
-cp com.anitasrinivasan.x-signals.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.anitasrinivasan.x-signals.plist
+git clone https://github.com/anitasrinivasan/x-signals.git
+cd x-signals
+./setup.sh
 ```
 
-The sync pipeline: fetch bookmarks → deduplicate → import to SQLite → enrich new tweets → cluster new tweets into narratives → Telegram notification.
+`setup.sh` creates a virtualenv, installs deps, walks through credential setup, runs the first-time pipeline, and installs a scheduler:
+
+| OS | Scheduler installed |
+|----|---------------------|
+| macOS | Two launchd agents: nightly sync at 23:00 + persistent Streamlit (auto-restarts on crash/reboot) |
+| Linux | crontab entry for nightly sync; start Streamlit manually or via systemd/screen |
+
+Open **http://localhost:8501** in your browser.
+
+**Accessing from other devices on the same network**
+
+Find the machine's local IP (`ip route get 1 | awk '{print $7}'` on Linux; System Settings → Network on Mac) and open `http://<ip>:8501` from any device on the same Wi-Fi.
+
+**Remote access from anywhere:** [Tailscale](https://tailscale.com) (free personal plan) creates a private mesh — install on both machines, then use the Tailscale IP instead of the LAN IP. No port-forwarding or firewall changes needed.
+
+---
+
+### Option B — Docker (Mac, Linux, VPS)
+
+```bash
+git clone https://github.com/anitasrinivasan/x-signals.git
+cd x-signals
+cp .env.example .env   # fill in your credentials
+docker compose up -d
+```
+
+The container runs the Streamlit UI **and** a nightly cron job for sync in one process. Data persists in `./data/` and `./pitches/` via volume mounts; the `.env` file is passed in automatically.
+
+To run the first-time pipeline inside the container:
+
+```bash
+docker compose exec x-signals python sync_bookmarks.py --full
+docker compose exec x-signals python enrich.py
+docker compose exec x-signals python cluster.py
+```
+
+Verify the cron job loaded: `docker compose exec x-signals crontab -l`
+
+**VPS (recommended for reliable nightly sync):** any small instance works — Hetzner CX11 (~€4/mo), DigitalOcean Basic (~$6/mo), Oracle Cloud Free Tier. Clone the repo, fill in `.env`, run `docker compose up -d`. Reverse-proxy with Caddy or nginx if you want a domain + HTTPS; otherwise access via IP:8501.
+
+---
+
+### Getting your Twitter/X cookies
+
+The sync uses your X.com session cookies directly (no API key required):
+
+1. Log into [x.com](https://x.com) in Chrome or Firefox
+2. Open DevTools (`Cmd+Option+I` / `F12`) → **Application** tab → **Cookies** → `https://x.com`
+3. Copy the value of **`auth_token`** → paste as `TWITTER_AUTH_TOKEN` in `.env`
+4. Copy the value of **`ct0`** → paste as `TWITTER_CT0` in `.env`
+
+> **Note:** cookies expire when you log out of X. If sync starts failing with 401 errors, re-copy the cookie values.
+
+---
+
+### API cost estimates
+
+All AI work uses your own Anthropic API key.
+
+| Phase | When | Typical cost |
+|-------|------|--------------|
+| Initial enrichment (~1,000 tweets) | One-time, first run | ~$3–8 |
+| Daily sync (10–20 new tweets) | Every night | ~$0.05–0.15 |
+| Pitch generation | Per session (on demand) | ~$0.10–0.30 |
+
+Costs scale with bookmark volume. The enrichment phase is the expensive part; after that, daily costs are minimal.
 
 ---
 
