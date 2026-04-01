@@ -1,6 +1,6 @@
 # x-signals
 
-A personal knowledge graph and writing assistant built on 5,000+ Twitter/X bookmarks. Designed for a legal/policy analyst who publishes at law review companions, Tech Policy Press, Lawfare, and Substack.
+A personal knowledge graph and writing assistant built on the user's own Twitter/X bookmarks. Designed for a legal/policy analyst who intends to convert these insights into publications at venues like law review companions, tech policy media, and even Substack.
 
 The core idea: rather than treating bookmarks as a flat archive to search, x-signals enriches them with structured metadata (topics, subtopics, positions, entities, claims), clusters them into discourse narratives, and lets Claude query the resulting knowledge graph to surface what's worth writing and why now.
 
