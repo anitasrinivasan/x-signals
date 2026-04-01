@@ -2,3 +2,6 @@
 *.log
 __pycache__/
 *.pyc
+signals.db
+signals.db-wal
+signals.db-shm

@@ -37,7 +37,7 @@ def load_env():
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
                     key, _, value = line.partition("=")
-                    os.environ.setdefault(key.strip(), value.strip())
+                    os.environ[key.strip()] = value.strip()
 
 
 def get_required_env(key):
@@ -159,6 +159,20 @@ def sync(batch_size):
     # Merge and save
     merged = existing_list + new_dicts
     save_master(merged)
+
+    # Upsert new rows into SQLite and enrich them
+    try:
+        from db import get_conn, init_db, import_from_json
+        from enrich import enrich_new
+        db_conn = get_conn()
+        if db_conn is None:
+            init_db()
+            db_conn = get_conn()
+        import_from_json(db_conn, verbose=False)
+        db_conn.close()
+        enrich_new(new_ids=[d["id"] for d in new_dicts], verbose=True)
+    except Exception as e:
+        print(f"[warn] DB/enrichment step failed: {e}", file=sys.stderr)
 
     msg = f"✅ x-signals: +{len(new_dicts)} new bookmarks (total: {len(merged)}) — {today}"
     print(msg)

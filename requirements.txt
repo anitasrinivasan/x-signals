@@ -1,0 +1,5 @@
+anthropic>=0.25
+streamlit>=1.32
+plotly>=5.0
+python-dotenv>=1.0
+twitter-cli>=0.8
