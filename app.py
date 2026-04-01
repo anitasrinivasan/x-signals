@@ -447,6 +447,7 @@ def browse_tab():
         authority_filter = st.multiselect("Authority", ["official", "expert", "community"])
 
         only_enriched = st.checkbox("Only enriched rows", value=True)
+        source_filter = st.multiselect("Source", ["twitter", "linkedin"])
 
     # Build query
     conditions = []
@@ -454,6 +455,11 @@ def browse_tab():
 
     if only_enriched:
         conditions.append("enriched_at IS NOT NULL")
+
+    if source_filter:
+        placeholders = ",".join("?" * len(source_filter))
+        conditions.append(f"source IN ({placeholders})")
+        params.extend(source_filter)
 
     if selected_topics:
         topic_conds = []

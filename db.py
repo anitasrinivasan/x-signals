@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS bookmarks (
     likes             INTEGER DEFAULT 0,
     views             INTEGER DEFAULT 0,
     created_at        TEXT,
+    source            TEXT DEFAULT 'twitter',
     -- enriched fields (NULL until processed by enrich.py)
     topics            TEXT,
     subtopics         TEXT,
@@ -108,11 +109,22 @@ CREATE TABLE IF NOT EXISTS narrative_edges (
 """
 
 
+def _migrate(conn):
+    """Apply incremental schema migrations to an existing DB. Idempotent."""
+    # v2: source column (twitter vs linkedin)
+    try:
+        conn.execute("ALTER TABLE bookmarks ADD COLUMN source TEXT DEFAULT 'twitter'")
+        conn.commit()
+    except Exception:
+        pass  # column already exists
+
+
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    _migrate(conn)
     return conn
 
 
@@ -193,6 +205,57 @@ def import_from_json(conn=None, json_path=None, verbose=True):
         print(f"Imported {inserted} new rows, skipped {skipped} existing.")
     if close:
         conn.close()
+    return inserted
+
+
+def import_linkedin(conn, posts: list, verbose=True):
+    """Import a list of LinkedIn saved post dicts into the bookmarks table."""
+    inserted = 0
+    skipped = 0
+    for p in posts:
+        post_id = p.get("id")
+        if not post_id:
+            continue
+        author = p.get("author", {})
+        metrics = p.get("metrics", {})
+        handle = author.get("handle") or (
+            author.get("profileUrl", "").rstrip("/").split("/")[-1]
+        )
+        row = {
+            "id": post_id,
+            "author_handle": handle,
+            "author_name": author.get("name"),
+            "author_verified": 0,
+            "text": p.get("text", ""),
+            "quoted_tweet_id": None,
+            "quoted_tweet_text": None,
+            "urls": json.dumps([p["postUrl"]] if p.get("postUrl") else []),
+            "media_types": json.dumps([]),
+            "likes": metrics.get("likes", 0) or 0,
+            "views": metrics.get("comments", 0) or 0,  # comments as engagement proxy
+            "created_at": p.get("createdAtISO") or p.get("createdAt"),
+            "source": "linkedin",
+        }
+        try:
+            conn.execute(
+                """INSERT OR IGNORE INTO bookmarks
+                   (id, author_handle, author_name, author_verified, text,
+                    quoted_tweet_id, quoted_tweet_text, urls, media_types,
+                    likes, views, created_at, source)
+                   VALUES (:id, :author_handle, :author_name, :author_verified, :text,
+                           :quoted_tweet_id, :quoted_tweet_text, :urls, :media_types,
+                           :likes, :views, :created_at, :source)""",
+                row,
+            )
+            if conn.execute("SELECT changes()").fetchone()[0]:
+                inserted += 1
+            else:
+                skipped += 1
+        except Exception as e:
+            print(f"[warn] Failed to insert LinkedIn post {post_id}: {e}", file=sys.stderr)
+    conn.commit()
+    if verbose:
+        print(f"LinkedIn: imported {inserted} new posts, skipped {skipped} existing.")
     return inserted
 
 

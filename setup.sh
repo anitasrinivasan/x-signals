@@ -22,8 +22,12 @@ fi
 source venv/bin/activate
 
 # Install dependencies
-echo "→ Installing dependencies..."
+echo "→ Installing Python dependencies..."
 pip install -r requirements.txt -q
+
+# Install Playwright's headless Chromium (needed for LinkedIn sync)
+echo "→ Installing Playwright Chromium (~300MB, one-time)..."
+playwright install chromium --with-deps 2>/dev/null || python3 -m playwright install chromium
 
 # .env setup
 if [ ! -f .env ]; then
@@ -42,6 +46,15 @@ if [ ! -f .env ]; then
     echo "TWITTER_AUTH_TOKEN=$auth_token"
     echo "TWITTER_CT0=$ct0"
   } > .env
+
+  echo ""
+  echo ""
+  echo "LinkedIn saved posts sync is optional (press Enter to skip)."
+  echo "  To get your li_at cookie: log into linkedin.com → DevTools → Application → Cookies → li_at"
+  read -p "LINKEDIN_LI_AT (optional): " li_at
+  if [ -n "$li_at" ]; then
+    echo "LINKEDIN_LI_AT=$li_at" >> .env
+  fi
 
   echo ""
   echo "Telegram notifications are optional (press Enter to skip both)."
@@ -151,25 +164,64 @@ PLIST
 </plist>
 PLIST
 
-    # Load both agents (unload first in case of re-run)
-    launchctl unload "$SYNC_PLIST" 2>/dev/null || true
-    launchctl unload "$APP_PLIST"  2>/dev/null || true
+    # ── 3. LinkedIn sync agent (23:15, staggered after Twitter) ─────────────
+    local LINKEDIN_PLIST="$PLIST_DIR/com.x-signals.linkedin.plist"
+    cat > "$LINKEDIN_PLIST" << PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.x-signals.linkedin</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$PYTHON_BIN</string>
+    <string>$SCRIPT_DIR/sync_linkedin.py</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>23</integer>
+    <key>Minute</key><integer>15</integer>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>$SCRIPT_DIR</string>
+  <key>StandardOutPath</key>
+  <string>$SCRIPT_DIR/sync_linkedin.log</string>
+  <key>StandardErrorPath</key>
+  <string>$SCRIPT_DIR/sync_linkedin.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>$SCRIPT_DIR/venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+</dict>
+</plist>
+PLIST
+
+    # Load all agents (unload first in case of re-run)
+    launchctl unload "$SYNC_PLIST"     2>/dev/null || true
+    launchctl unload "$APP_PLIST"      2>/dev/null || true
+    launchctl unload "$LINKEDIN_PLIST" 2>/dev/null || true
     launchctl load   "$SYNC_PLIST"
     launchctl load   "$APP_PLIST"
+    launchctl load   "$LINKEDIN_PLIST"
 
     echo ""
     echo "✅ Scheduler installed:"
-    echo "   • Nightly sync:    23:00 daily  (com.x-signals.sync)"
+    echo "   • Twitter sync:    23:00 daily  (com.x-signals.sync)"
+    echo "   • LinkedIn sync:   23:15 daily  (com.x-signals.linkedin)"
     echo "   • Persistent app:  running now, restarts on reboot  (com.x-signals.app)"
 
   else
-    # Linux: add crontab entry (idempotent — remove existing x-signals line first)
+    # Linux: add crontab entries (idempotent — remove existing x-signals lines first)
     ( crontab -l 2>/dev/null | grep -v "x-signals" ; \
-      echo "0 23 * * * $PYTHON_BIN $SCRIPT_DIR/sync_bookmarks.py >> $SCRIPT_DIR/sync.log 2>&1" \
+      echo "0 23 * * * $PYTHON_BIN $SCRIPT_DIR/sync_bookmarks.py >> $SCRIPT_DIR/sync.log 2>&1" ; \
+      echo "15 23 * * * $PYTHON_BIN $SCRIPT_DIR/sync_linkedin.py >> $SCRIPT_DIR/sync_linkedin.log 2>&1" \
     ) | crontab -
 
     echo ""
-    echo "✅ Cron job installed (nightly sync at 23:00)"
+    echo "✅ Cron jobs installed (Twitter at 23:00, LinkedIn at 23:15)"
     echo "   To start the app now:  source venv/bin/activate && streamlit run app.py"
     echo "   To keep it running:    use screen, tmux, or a systemd unit"
   fi
