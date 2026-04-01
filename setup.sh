@@ -52,8 +52,12 @@ if [ ! -f .env ]; then
     echo "TELEGRAM_CHAT_ID=$tg_chat"   >> .env
   fi
 
-  echo "✅ .env created."
+  chmod 600 .env
+  echo "✅ .env created (permissions: 600)."
 fi
+
+# Ensure .env is always owner-only readable, even if it predates this script
+chmod 600 .env 2>/dev/null || true
 
 # First-time data pipeline
 echo ""
@@ -124,7 +128,7 @@ PLIST
     <string>$SCRIPT_DIR/venv/bin/streamlit</string>
     <string>run</string>
     <string>$SCRIPT_DIR/app.py</string>
-    <string>--server.address=0.0.0.0</string>
+    <string>--server.address=127.0.0.1</string>
     <string>--server.port=8501</string>
     <string>--server.headless=true</string>
   </array>
@@ -172,6 +176,10 @@ PLIST
 }
 
 install_scheduler
+
+# Harden log file permissions (create if absent, then lock to owner-only)
+touch "$SCRIPT_DIR/sync.log" "$SCRIPT_DIR/app.log"
+chmod 600 "$SCRIPT_DIR/sync.log" "$SCRIPT_DIR/app.log"
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

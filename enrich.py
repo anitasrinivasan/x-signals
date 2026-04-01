@@ -86,14 +86,18 @@ def get_unenriched(conn, limit=None, ids=None, worker=None, num_workers=None):
             ids,
         ).fetchall()
     conditions = ["enriched_at IS NULL"]
+    params = []
     if worker is not None and num_workers:
-        conditions.append(f"(rowid % {num_workers}) = {worker}")
+        # Use parameterized query — never interpolate worker/num_workers directly
+        conditions.append("(rowid % ?) = ?")
+        params.extend([int(num_workers), int(worker)])
     where = " AND ".join(conditions)
     q = (f"SELECT id, author_handle, text, quoted_tweet_text FROM bookmarks "
          f"WHERE {where} ORDER BY created_at DESC")
     if limit:
-        q += f" LIMIT {limit}"
-    return conn.execute(q).fetchall()
+        q += " LIMIT ?"
+        params.append(int(limit))
+    return conn.execute(q, params).fetchall()
 
 
 def build_user_message(batch):

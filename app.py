@@ -142,25 +142,17 @@ def save_pitches(text):
 
 
 def format_pitch_telegram(text, date_str):
-    """Extract first 2 pitch blocks for Telegram preview."""
-    lines = text.strip().splitlines()
-    previews = []
-    current = []
-    for line in lines:
-        if line.startswith("**") and current:
-            previews.append("\n".join(current).strip())
-            current = [line]
-            if len(previews) >= 2:
-                break
-        else:
-            current.append(line)
-    if current and len(previews) < 2:
-        previews.append("\n".join(current).strip())
+    """Build a Telegram notification for completed pitches.
 
-    body = "\n\n".join(p[:300] for p in previews[:2])
-    total = text.count("\n**")  # rough pitch count
-    more = f"\n\n[+{max(0, total - 2)} more pitches saved locally]" if total > 2 else ""
-    return f"📝 *x-signals pitches — {date_str}*\n\n{body}{more}"
+    Sends only a count and confirmation — pitch content stays local.
+    Avoids sending reading patterns or draft analysis to Telegram's servers.
+    """
+    total = max(1, text.count("\n**") + 1)  # rough pitch count
+    return (
+        f"📝 *x-signals — {date_str}*\n"
+        f"{total} pitch{'es' if total != 1 else ''} generated and saved locally.\n"
+        f"Open the app to review."
+    )
 
 
 def get_conn():
