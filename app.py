@@ -8,6 +8,7 @@ Run with: streamlit run app.py
 import json
 import os
 import sqlite3
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -45,29 +46,46 @@ WRITING_ASSISTANT_SYSTEM = """You are a research and writing assistant for a leg
 
 The analyst's expertise spans crypto regulation, digital asset policy, AI governance, and the transformation of the legal profession by AI. She writes long-form, well-sourced arguments — not news recaps.
 
-You have access to a `query_db` tool that queries her personal research corpus: 5,000+ Twitter bookmarks spanning Dec 2022–Mar 2026, enriched with topic tags, content types, summaries, and core claims.
+You have access to two tools:
 
-Schema:
-- bookmarks(id, author_handle, author_name, text, quoted_tweet_text, created_at, topics [JSON], subtopics [JSON], content_type, authority, summary, core_claim, position, entities [JSON], likes, views, urls [JSON])
-- topics/subtopics/entities are stored as JSON strings — use json_each() to filter by them
-- created_at is ISO 8601
+1. `query_narratives` — queries pre-computed narrative clusters derived from the bookmark corpus.
+   Tables: narratives(id, title, description, key_claim, dominant_topic, dominant_position,
+   momentum_score, momentum_delta, tweet_count, first_seen, last_seen, status),
+   tweet_narratives(tweet_id, narrative_id, role),
+   narrative_edges(source_id, target_id, edge_type, weight).
+   momentum_score (0–1): overall activity. momentum_delta: positive = heating up, negative = cooling.
+
+2. `query_db` — queries the raw bookmark corpus: 5,000+ Twitter bookmarks spanning Dec 2022–Mar 2026.
+   Schema: bookmarks(id, author_handle, author_name, text, quoted_tweet_text, created_at,
+   topics [JSON], subtopics [JSON], content_type, authority, summary, core_claim, position,
+   entities [JSON], likes, views, urls [JSON]).
+   Use json_each(topics) to filter by topic. created_at is ISO 8601.
 
 When answering:
-- Always query the corpus for evidence before drawing conclusions
+- For trend analysis and pitch generation: start with query_narratives, then use query_db only to fetch specific supporting tweets
 - Cite specific tweets by author_handle and summary/core_claim
 - Distinguish between expert opinion, primary sources, and community views
 - Be direct about what the corpus does and doesn't contain
 - For writing pitches, be specific: a real thesis, not just a topic area"""
 
-WHAT_TO_WRITE_PROMPT = """Analyze my recent bookmarks (last 60 days) to surface what I should write next.
+WHAT_TO_WRITE_PROMPT = """Analyze my bookmark corpus to surface what I should write next.
 
-For each pitch, tell me:
+Start by calling query_narratives to get the narrative landscape:
+  SELECT * FROM narratives ORDER BY momentum_score DESC LIMIT 30
+
+Then identify:
+1. Narratives with high positive momentum_delta (heating up fast — write now)
+2. Narratives with strong position split (dominant_position = 'mixed' or near-even pro/con — contested debate with no winner yet)
+3. Narrative pairs connected by edges (cross-topic stories no one has connected in print)
+4. High momentum_score but zero edges (isolated discourse — potential first-mover piece)
+
+For each pitch, use query_db to fetch 3-4 specific supporting tweets from tweet_narratives JOIN bookmarks.
+
+Surface 4-5 pitches. For each:
 1. **The thesis** — a specific, arguable claim, not just a topic
-2. **Why now** — what in recent bookmarks signals this is the right moment (a debate reaching inflection, threads converging, regulatory event on horizon, gap in coverage)
-3. **Venue** — recommend one: law review companion (novel legal argument, doctrinal depth needed), Tech Policy Press/Lawfare (timely policy analysis, 1500-3000 words, practitioner audience), Substack (nuanced take for engaged followers), or Thread (fastest-moving narrative, insert into active debate)
-4. **Key sources** — 3-4 specific bookmarks from the corpus that would anchor the piece
-
-Surface 4-5 pitches. Focus on arguments that are timely, that I'm positioned to make given what I've been tracking, and that haven't already been written to death."""
+2. **Why now** — what the momentum data signals (delta direction, position split, convergence)
+3. **Venue** — law review companion (doctrinal depth), Tech Policy Press/Lawfare (timely policy, 1500-3000w), Substack (nuanced take), or Thread (fast-moving)
+4. **Key sources** — 3-4 specific tweets from the corpus (author + claim)"""
 
 
 def load_env():
@@ -156,6 +174,165 @@ def tweet_card(t, show_summary=True):
         link_col.markdown(f"[→ Tweet]({tweet_url})")
 
         st.divider()
+
+
+# ---------------------------------------------------------------------------
+# Narrative Graph tab
+# ---------------------------------------------------------------------------
+
+def narrative_graph_tab():
+    st.header("Narrative Graph")
+
+    # Check if narratives exist
+    narratives = run_query(
+        "SELECT id, title, description, key_claim, dominant_topic, dominant_position, "
+        "momentum_score, momentum_delta, tweet_count, first_seen, last_seen, status "
+        "FROM narratives ORDER BY momentum_score DESC"
+    )
+    if not narratives:
+        st.info(
+            "No narratives yet. Run `python3 cluster.py` to generate narrative clusters."
+        )
+        return
+
+    edges = run_query(
+        "SELECT source_id, target_id, edge_type, weight FROM narrative_edges"
+    )
+
+    # Sidebar controls
+    with st.sidebar:
+        st.subheader("Narrative filters")
+        min_tweets = st.slider("Min tweet count", 1, 30, 3)
+        topic_filter = st.multiselect("Topic filter", TOPICS)
+        status_filter = st.selectbox("Status", ["All", "active", "dormant"])
+
+    # Filter narratives
+    filtered = [
+        n for n in narratives
+        if n["tweet_count"] >= min_tweets
+        and (not topic_filter or n["dominant_topic"] in topic_filter)
+        and (status_filter == "All" or n["status"] == status_filter)
+    ]
+
+    if not filtered:
+        st.warning("No narratives match current filters.")
+        return
+
+    filtered_ids = {n["id"] for n in filtered}
+    filtered_edges = [
+        e for e in edges
+        if e["source_id"] in filtered_ids and e["target_id"] in filtered_ids
+    ]
+
+    # Metrics row
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Narratives", len(filtered))
+    m2.metric("Edges", len(filtered_edges))
+    heating = sum(1 for n in filtered if n["momentum_delta"] > 0.05)
+    m3.metric("↑ Heating up", heating)
+    cooling = sum(1 for n in filtered if n["momentum_delta"] < -0.05)
+    m4.metric("↓ Cooling", cooling)
+
+    # Build pyvis graph
+    try:
+        import networkx as nx
+        from pyvis.network import Network
+
+        G = nx.Graph()
+        for n in filtered:
+            color = TOPIC_COLORS.get(n["dominant_topic"] or "", "#6b7280")
+            size  = max(10, min(60, (n["tweet_count"] or 1) * 3))
+            delta = n["momentum_delta"] or 0
+            arrow = "↑" if delta > 0.05 else ("↓" if delta < -0.05 else "→")
+            label = (n["title"] or n["id"])[:40]
+            hover = (
+                f"<b>{n['title'] or 'Unlabelled'}</b><br>"
+                f"Momentum: {n['momentum_score']:.3f} {arrow}{delta:+.3f}<br>"
+                f"Tweets: {n['tweet_count']} · {n['dominant_position'] or '?'}<br>"
+                f"<i>{(n['description'] or '')[:120]}</i>"
+            )
+            G.add_node(n["id"], label=label, size=size, color=color, title=hover)
+
+        edge_colors = {
+            "subtopic_overlap": "#6b7280",
+            "entity_anchor":    "#f59e0b",
+            "position_opposition": "#ef4444",
+        }
+        for e in filtered_edges:
+            ecolor = edge_colors.get(e["edge_type"], "#6b7280")
+            G.add_edge(
+                e["source_id"], e["target_id"],
+                weight=e["weight"], color=ecolor,
+                width=max(1, int(e["weight"])),
+            )
+
+        net = Network(
+            height="600px", width="100%",
+            bgcolor="#0e1117", font_color="white",
+            notebook=False,
+        )
+        net.from_nx(G)
+        net.set_options(json.dumps({
+            "physics": {
+                "stabilization": {"iterations": 150},
+                "barnesHut": {"gravitationalConstant": -8000, "springLength": 120},
+            },
+            "edges": {"smooth": {"type": "continuous"}},
+            "interaction": {"hover": True, "tooltipDelay": 100},
+        }))
+
+        with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w") as f:
+            net.save_graph(f.name)
+            html = open(f.name).read()
+        st.components.v1.html(html, height=620, scrolling=False)
+
+    except ImportError:
+        st.error("pyvis/networkx not installed. Run: `pip install pyvis networkx`")
+        st.info("Showing table view instead.")
+
+    # Momentum leaderboard
+    st.subheader("Momentum leaderboard")
+    leaderboard = sorted(filtered, key=lambda n: n["momentum_score"], reverse=True)[:15]
+    rows = []
+    for n in leaderboard:
+        delta = n["momentum_delta"] or 0
+        arrow = "↑" if delta > 0.05 else ("↓" if delta < -0.05 else "→")
+        rows.append({
+            "Narrative": n["title"] or n["id"],
+            "Topic": n["dominant_topic"] or "—",
+            "Tweets": n["tweet_count"],
+            "Score": f"{n['momentum_score']:.3f}",
+            "Trend": f"{arrow} {delta:+.3f}",
+            "Position": n["dominant_position"] or "—",
+            "Last seen": (n["last_seen"] or "")[:10],
+        })
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+
+    # Narrative detail expander
+    st.subheader("Narrative details")
+    selected_title = st.selectbox(
+        "Select narrative to explore",
+        options=[n["title"] or f"Narrative {n['id']}" for n in filtered],
+    )
+    selected = next((n for n in filtered if (n["title"] or f"Narrative {n['id']}") == selected_title), None)
+    if selected:
+        st.markdown(f"**{selected['title']}**")
+        if selected.get("description"):
+            st.write(selected["description"])
+        if selected.get("key_claim"):
+            st.caption(f"**Key claim:** {selected['key_claim']}")
+
+        # Fetch tweets for this narrative
+        narrative_tweets = run_query(
+            """SELECT b.*, tn.role FROM bookmarks b
+               JOIN tweet_narratives tn ON b.id = tn.tweet_id
+               WHERE tn.narrative_id = ?
+               ORDER BY b.created_at DESC LIMIT 25""",
+            (selected["id"],),
+        )
+        st.caption(f"{len(narrative_tweets)} tweets in this narrative")
+        for t in narrative_tweets:
+            tweet_card(t)
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +551,7 @@ def writing_assistant_tab():
     if not user_input:
         return
 
-    # Agentic loop with query_db tool
+    # Tools for the agentic loop
     query_db_tool = {
         "name": "query_db",
         "description": (
@@ -385,7 +562,8 @@ def writing_assistant_tab():
             "content_type TEXT, authority TEXT, summary TEXT, core_claim TEXT, position TEXT, "
             "entities TEXT [JSON array], likes INT, views INT, urls TEXT [JSON array]). "
             "Use json_each(topics) to filter by topic. created_at is ISO 8601. "
-            "Limit results to avoid overwhelming the context."
+            "Limit results to avoid overwhelming the context. "
+            "Also has access to tweet_narratives(tweet_id, narrative_id, role) for joining."
         ),
         "input_schema": {
             "type": "object",
@@ -399,6 +577,36 @@ def writing_assistant_tab():
         },
     }
 
+    query_narratives_tool = {
+        "name": "query_narratives",
+        "description": (
+            "Query pre-computed narrative clusters. USE THIS FIRST for 'What to Write Next' and Topic Briefing. "
+            "Returns compact narrative summaries (~75 tokens each). "
+            "Tables: "
+            "narratives(id INT, title TEXT, description TEXT, key_claim TEXT, dominant_topic TEXT, "
+            "dominant_position TEXT, momentum_score REAL 0-1, momentum_delta REAL, "
+            "tweet_count INT, first_seen TEXT, last_seen TEXT, status TEXT), "
+            "tweet_narratives(tweet_id TEXT, narrative_id INT, role TEXT), "
+            "narrative_edges(source_id INT, target_id INT, edge_type TEXT, weight REAL). "
+            "momentum_delta > 0 means heating up, < 0 means cooling. "
+            "dominant_position: pro | con | neutral | mixed."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sql": {
+                    "type": "string",
+                    "description": "A valid SQLite SELECT statement against narrative tables.",
+                }
+            },
+            "required": ["sql"],
+        },
+    }
+
+    # Check whether narratives table has data; only include the tool if populated
+    has_narratives = bool(run_query("SELECT 1 FROM narratives LIMIT 1"))
+    tools = [query_narratives_tool, query_db_tool] if has_narratives else [query_db_tool]
+
     messages = [{"role": "user", "content": user_input}]
 
     with st.spinner("Researching your corpus…"):
@@ -411,7 +619,7 @@ def writing_assistant_tab():
                 model="claude-sonnet-4-5",
                 max_tokens=4096,
                 system=WRITING_ASSISTANT_SYSTEM,
-                tools=[query_db_tool],
+                tools=tools,
                 messages=messages,
             )
 
@@ -437,15 +645,43 @@ def writing_assistant_tab():
 
             for tool_call in tool_calls:
                 sql = tool_call.input.get("sql", "")
-                query_log.append(sql)
+                tool_name = tool_call.name
+                query_log.append(f"[{tool_name}] {sql}")
 
                 if not sql.strip().upper().startswith("SELECT"):
                     result_content = json.dumps({"error": "Only SELECT queries are allowed."})
                 else:
                     try:
                         rows = run_query(sql)
-                        # Limit payload size
-                        result_content = json.dumps(rows[:50], default=str)
+
+                        if tool_name == "query_narratives":
+                            # Narrative rows are already compact — pass through as-is, cap at 30
+                            slimmed = [dict(r) for r in rows[:30]]
+                        else:
+                            # Slim bookmark rows to key fields, truncate long text
+                            def slim(r):
+                                return {
+                                    "id": r.get("id"),
+                                    "author": r.get("author_handle"),
+                                    "created_at": (r.get("created_at") or "")[:10],
+                                    "summary": (r.get("summary") or "")[:200],
+                                    "core_claim": (r.get("core_claim") or "")[:150],
+                                    "topics": r.get("topics"),
+                                    "subtopics": r.get("subtopics"),
+                                    "content_type": r.get("content_type"),
+                                    "authority": r.get("authority"),
+                                    "position": r.get("position"),
+                                    "text": (r.get("text") or "")[:200],
+                                    "likes": r.get("likes"),
+                                    "views": r.get("views"),
+                                }
+                            slimmed = [slim(r) for r in rows[:20]]
+
+                        result_content = json.dumps({
+                            "total_matched": len(rows),
+                            "returned": len(slimmed),
+                            "rows": slimmed,
+                        }, default=str)
                     except Exception as e:
                         result_content = json.dumps({"error": str(e)})
 
@@ -503,11 +739,13 @@ def main():
         )
 
     # Navigation
-    tab1, tab2 = st.tabs(["✍️ Writing Assistant", "🔍 Browse"])
+    tab1, tab2, tab3 = st.tabs(["✍️ Writing Assistant", "🕸️ Narrative Graph", "🔍 Browse"])
 
     with tab1:
         writing_assistant_tab()
     with tab2:
+        narrative_graph_tab()
+    with tab3:
         browse_tab()
 
 

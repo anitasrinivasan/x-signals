@@ -77,7 +77,7 @@ def load_env():
                     os.environ[key.strip()] = value.strip()
 
 
-def get_unenriched(conn, limit=None, ids=None):
+def get_unenriched(conn, limit=None, ids=None, worker=None, num_workers=None):
     if ids:
         placeholders = ",".join("?" * len(ids))
         return conn.execute(
@@ -85,8 +85,12 @@ def get_unenriched(conn, limit=None, ids=None):
             f"WHERE id IN ({placeholders})",
             ids,
         ).fetchall()
-    q = ("SELECT id, author_handle, text, quoted_tweet_text FROM bookmarks "
-         "WHERE enriched_at IS NULL ORDER BY created_at DESC")
+    conditions = ["enriched_at IS NULL"]
+    if worker is not None and num_workers:
+        conditions.append(f"(rowid % {num_workers}) = {worker}")
+    where = " AND ".join(conditions)
+    q = (f"SELECT id, author_handle, text, quoted_tweet_text FROM bookmarks "
+         f"WHERE {where} ORDER BY created_at DESC")
     if limit:
         q += f" LIMIT {limit}"
     return conn.execute(q).fetchall()
@@ -146,7 +150,7 @@ def enrich_new(new_ids, verbose=True):
     conn.close()
 
 
-def _run_enrichment(client, conn, rows, verbose=True):
+def _run_enrichment(client, conn, rows, verbose=True, label=""):
     from db import upsert_enrichment
 
     total = len(rows)
@@ -159,15 +163,33 @@ def _run_enrichment(client, conn, rows, verbose=True):
         total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
 
         if verbose:
-            print(f"Batch {batch_num}/{total_batches} ({len(batch)} tweets)...", end=" ", flush=True)
+            print(f"{label}Batch {batch_num}/{total_batches} ({len(batch)} tweets)...", end=" ", flush=True)
 
         try:
             results = call_claude(client, batch)
         except Exception as e:
-            print(f"ERROR: {e}")
-            errors += len(batch)
-            time.sleep(5)
-            continue
+            err_str = str(e)
+            # Retry on rate limit with exponential backoff
+            if "429" in err_str or "rate_limit" in err_str:
+                for wait in [30, 60, 120]:
+                    print(f"rate limit, retrying in {wait}s...", end=" ", flush=True)
+                    time.sleep(wait)
+                    try:
+                        results = call_claude(client, batch)
+                        break
+                    except Exception as e2:
+                        err_str = str(e2)
+                        if "429" not in err_str and "rate_limit" not in err_str:
+                            break
+                else:
+                    print(f"ERROR (gave up): {e}")
+                    errors += len(batch)
+                    continue
+            else:
+                print(f"ERROR: {e}")
+                errors += len(batch)
+                time.sleep(5)
+                continue
 
         now = datetime.now(timezone.utc).isoformat()
         batch_enriched = 0
@@ -188,12 +210,12 @@ def _run_enrichment(client, conn, rows, verbose=True):
         if verbose:
             print(f"ok ({batch_enriched}/{len(batch)} written, {enriched}/{total} total)")
 
-        # Polite rate-limit pause between batches
+        # Polite rate-limit pause between batches (8k tokens/min limit → ~10s safe gap)
         if i + BATCH_SIZE < total:
-            time.sleep(1)
+            time.sleep(10)
 
     if verbose:
-        print(f"\nDone. Enriched {enriched}/{total} tweets. Errors: {errors}.")
+        print(f"\n{label}Done. Enriched {enriched}/{total} tweets. Errors: {errors}.")
     return enriched
 
 
@@ -216,13 +238,23 @@ if __name__ == "__main__":
     # Parse args
     ids = None
     limit = None
+    worker = None
+    num_workers = None
     args = sys.argv[1:]
     if "--ids" in args:
         idx = args.index("--ids")
         ids = args[idx + 1:]
-    elif "--limit" in args:
+    if "--limit" in args:
         idx = args.index("--limit")
         limit = int(args[idx + 1])
+    if "--worker" in args:
+        idx = args.index("--worker")
+        worker = int(args[idx + 1])
+    if "--num-workers" in args:
+        idx = args.index("--num-workers")
+        num_workers = int(args[idx + 1])
+
+    worker_label = f"[worker {worker}/{num_workers}] " if worker is not None else ""
 
     # Ensure DB exists
     conn = get_conn()
@@ -232,18 +264,18 @@ if __name__ == "__main__":
         print("DB not initialised. Run: python3 db.py")
         sys.exit(1)
 
-    rows = get_unenriched(conn, limit=limit, ids=ids)
+    rows = get_unenriched(conn, limit=limit, ids=ids, worker=worker, num_workers=num_workers)
 
     if not rows:
         s = stats()
-        print(f"Nothing to enrich. ({s['enriched']}/{s['total']} already enriched)")
+        print(f"{worker_label}Nothing to enrich. ({s['enriched']}/{s['total']} already enriched)")
         conn.close()
         sys.exit(0)
 
-    print(f"Enriching {len(rows)} tweets with {MODEL}...")
+    print(f"{worker_label}Enriching {len(rows)} tweets with {MODEL}...")
     client = anthropic.Anthropic(api_key=api_key)
-    _run_enrichment(client, conn, rows)
+    _run_enrichment(client, conn, rows, verbose=True, label=worker_label)
     conn.close()
 
     s = stats()
-    print(f"DB status: {s['enriched']}/{s['total']} enriched.")
+    print(f"{worker_label}Done. DB status: {s['enriched']}/{s['total']} enriched.")

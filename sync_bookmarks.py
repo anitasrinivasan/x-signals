@@ -171,6 +171,8 @@ def sync(batch_size):
         import_from_json(db_conn, verbose=False)
         db_conn.close()
         enrich_new(new_ids=[d["id"] for d in new_dicts], verbose=True)
+        from cluster import cluster_new
+        cluster_new(new_ids=[d["id"] for d in new_dicts])
     except Exception as e:
         print(f"[warn] DB/enrichment step failed: {e}", file=sys.stderr)
 

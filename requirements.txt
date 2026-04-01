@@ -3,3 +3,5 @@ streamlit>=1.32
 plotly>=5.0
 python-dotenv>=1.0
 twitter-cli>=0.8
+pyvis>=0.3
+networkx>=3.0

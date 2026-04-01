@@ -69,6 +69,42 @@ CREATE TRIGGER IF NOT EXISTS bookmarks_ad AFTER DELETE ON bookmarks BEGIN
     INSERT INTO bookmarks_fts(bookmarks_fts, rowid, id, author_handle, text, summary, topics, entities)
     VALUES ('delete', old.rowid, old.id, old.author_handle, old.text, old.summary, old.topics, old.entities);
 END;
+
+CREATE TABLE IF NOT EXISTS narratives (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    slug              TEXT UNIQUE,
+    title             TEXT,
+    description       TEXT,
+    key_claim         TEXT,
+    dominant_topic    TEXT,
+    dominant_position TEXT,
+    status            TEXT DEFAULT 'active',
+    tweet_count       INTEGER DEFAULT 0,
+    momentum_score    REAL DEFAULT 0.0,
+    momentum_delta    REAL DEFAULT 0.0,
+    first_seen        TEXT,
+    last_seen         TEXT,
+    clustered_at      TEXT
+);
+
+CREATE TABLE IF NOT EXISTS tweet_narratives (
+    tweet_id      TEXT NOT NULL,
+    narrative_id  INTEGER NOT NULL,
+    role          TEXT,
+    PRIMARY KEY (tweet_id, narrative_id),
+    FOREIGN KEY (tweet_id)     REFERENCES bookmarks(id),
+    FOREIGN KEY (narrative_id) REFERENCES narratives(id)
+);
+
+CREATE TABLE IF NOT EXISTS narrative_edges (
+    source_id  INTEGER NOT NULL,
+    target_id  INTEGER NOT NULL,
+    edge_type  TEXT,
+    weight     REAL DEFAULT 1.0,
+    PRIMARY KEY (source_id, target_id),
+    FOREIGN KEY (source_id) REFERENCES narratives(id),
+    FOREIGN KEY (target_id) REFERENCES narratives(id)
+);
 """
 
 
@@ -207,6 +243,78 @@ def stats():
         "FROM bookmarks"
     )
     return rows[0] if rows else {}
+
+
+def get_all_enriched(conn):
+    """Return all enriched bookmarks as list of dicts."""
+    rows = conn.execute(
+        """SELECT id, subtopics, entities, position, authority,
+                  likes, views, created_at, topics, summary, core_claim, author_handle
+           FROM bookmarks WHERE enriched_at IS NOT NULL"""
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def upsert_narrative(conn, d):
+    """Insert or replace a narrative row. Returns the narrative id."""
+    conn.execute(
+        """INSERT INTO narratives
+               (slug, title, description, key_claim, dominant_topic, dominant_position,
+                status, tweet_count, momentum_score, momentum_delta,
+                first_seen, last_seen, clustered_at)
+           VALUES
+               (:slug, :title, :description, :key_claim, :dominant_topic, :dominant_position,
+                :status, :tweet_count, :momentum_score, :momentum_delta,
+                :first_seen, :last_seen, :clustered_at)
+           ON CONFLICT(slug) DO UPDATE SET
+               title=excluded.title,
+               description=excluded.description,
+               key_claim=excluded.key_claim,
+               dominant_topic=excluded.dominant_topic,
+               dominant_position=excluded.dominant_position,
+               status=excluded.status,
+               tweet_count=excluded.tweet_count,
+               momentum_score=excluded.momentum_score,
+               momentum_delta=excluded.momentum_delta,
+               first_seen=excluded.first_seen,
+               last_seen=excluded.last_seen,
+               clustered_at=excluded.clustered_at""",
+        d,
+    )
+    row = conn.execute("SELECT id FROM narratives WHERE slug=?", (d["slug"],)).fetchone()
+    return row["id"]
+
+
+def link_tweet_narrative(conn, tweet_id, narrative_id, role):
+    """Link a tweet to a narrative (idempotent)."""
+    conn.execute(
+        "INSERT OR IGNORE INTO tweet_narratives (tweet_id, narrative_id, role) VALUES (?,?,?)",
+        (tweet_id, narrative_id, role),
+    )
+
+
+def upsert_edge(conn, source_id, target_id, edge_type, weight):
+    """Insert or replace a narrative edge."""
+    conn.execute(
+        """INSERT INTO narrative_edges (source_id, target_id, edge_type, weight)
+           VALUES (?,?,?,?)
+           ON CONFLICT(source_id, target_id) DO UPDATE SET
+               edge_type=excluded.edge_type, weight=excluded.weight""",
+        (source_id, target_id, edge_type, weight),
+    )
+
+
+def get_narrative_summaries(conn, limit=200):
+    """Compact narrative rows for Claude queries."""
+    rows = conn.execute(
+        """SELECT id, title, description, key_claim, dominant_topic, dominant_position,
+                  momentum_score, momentum_delta, tweet_count, first_seen, last_seen, status
+           FROM narratives
+           ORDER BY momentum_score DESC
+           LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 
 if __name__ == "__main__":

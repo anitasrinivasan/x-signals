@@ -5,3 +5,4 @@ __pycache__/
 signals.db
 signals.db-wal
 signals.db-shm
+twitter_bookmarks.json
