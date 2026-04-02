@@ -199,29 +199,72 @@ PLIST
 </plist>
 PLIST
 
+    # ── 4. Monthly full re-cluster (1st of month, 23:30) ────────────────────
+    local RECLUSTER_PLIST="$PLIST_DIR/com.x-signals.recluster.plist"
+    cat > "$RECLUSTER_PLIST" << PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.x-signals.recluster</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$PYTHON_BIN</string>
+    <string>$SCRIPT_DIR/cluster.py</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Day</key><integer>1</integer>
+    <key>Hour</key><integer>23</integer>
+    <key>Minute</key><integer>30</integer>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>$SCRIPT_DIR</string>
+  <key>StandardOutPath</key>
+  <string>$SCRIPT_DIR/recluster.log</string>
+  <key>StandardErrorPath</key>
+  <string>$SCRIPT_DIR/recluster.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>$SCRIPT_DIR/venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+</dict>
+</plist>
+PLIST
+
     # Load all agents (unload first in case of re-run)
-    launchctl unload "$SYNC_PLIST"     2>/dev/null || true
-    launchctl unload "$APP_PLIST"      2>/dev/null || true
-    launchctl unload "$LINKEDIN_PLIST" 2>/dev/null || true
+    launchctl unload "$SYNC_PLIST"      2>/dev/null || true
+    launchctl unload "$APP_PLIST"       2>/dev/null || true
+    launchctl unload "$LINKEDIN_PLIST"  2>/dev/null || true
+    launchctl unload "$RECLUSTER_PLIST" 2>/dev/null || true
     launchctl load   "$SYNC_PLIST"
     launchctl load   "$APP_PLIST"
     launchctl load   "$LINKEDIN_PLIST"
+    launchctl load   "$RECLUSTER_PLIST"
 
     echo ""
     echo "✅ Scheduler installed:"
-    echo "   • Twitter sync:    23:00 daily  (com.x-signals.sync)"
-    echo "   • LinkedIn sync:   23:15 daily  (com.x-signals.linkedin)"
+    echo "   • Twitter sync:    23:00 daily        (com.x-signals.sync)"
+    echo "   • LinkedIn sync:   23:15 daily        (com.x-signals.linkedin)"
+    echo "   • Full re-cluster: 23:30 on 1st/month (com.x-signals.recluster)"
     echo "   • Persistent app:  running now, restarts on reboot  (com.x-signals.app)"
 
   else
     # Linux: add crontab entries (idempotent — remove existing x-signals lines first)
     ( crontab -l 2>/dev/null | grep -v "x-signals" ; \
       echo "0 23 * * * $PYTHON_BIN $SCRIPT_DIR/sync_bookmarks.py >> $SCRIPT_DIR/sync.log 2>&1" ; \
-      echo "15 23 * * * $PYTHON_BIN $SCRIPT_DIR/sync_linkedin.py >> $SCRIPT_DIR/sync_linkedin.log 2>&1" \
+      echo "15 23 * * * $PYTHON_BIN $SCRIPT_DIR/sync_linkedin.py >> $SCRIPT_DIR/sync_linkedin.log 2>&1" ; \
+      echo "30 23 1 * * $PYTHON_BIN $SCRIPT_DIR/cluster.py >> $SCRIPT_DIR/recluster.log 2>&1" \
     ) | crontab -
 
     echo ""
-    echo "✅ Cron jobs installed (Twitter at 23:00, LinkedIn at 23:15)"
+    echo "✅ Cron jobs installed:"
+    echo "   • Twitter sync:    23:00 daily"
+    echo "   • LinkedIn sync:   23:15 daily"
+    echo "   • Full re-cluster: 23:30 on 1st of month"
     echo "   To start the app now:  source venv/bin/activate && streamlit run app.py"
     echo "   To keep it running:    use screen, tmux, or a systemd unit"
   fi
@@ -230,8 +273,8 @@ PLIST
 install_scheduler
 
 # Harden log file permissions (create if absent, then lock to owner-only)
-touch "$SCRIPT_DIR/sync.log" "$SCRIPT_DIR/app.log"
-chmod 600 "$SCRIPT_DIR/sync.log" "$SCRIPT_DIR/app.log"
+touch "$SCRIPT_DIR/sync.log" "$SCRIPT_DIR/app.log" "$SCRIPT_DIR/recluster.log"
+chmod 600 "$SCRIPT_DIR/sync.log" "$SCRIPT_DIR/app.log" "$SCRIPT_DIR/recluster.log"
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

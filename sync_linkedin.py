@@ -27,7 +27,6 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
-MASTER_JSON = SCRIPT_DIR / "linkedin_bookmarks.json"
 SAVED_POSTS_URL = "https://www.linkedin.com/my-items/saved-posts/"
 
 # How many posts to fetch on each run
@@ -50,25 +49,6 @@ def load_env():
                     os.environ[key.strip()] = value.strip()
 
 
-def load_master():
-    """Load linkedin_bookmarks.json, return (list_of_dicts, set_of_ids)."""
-    if not MASTER_JSON.exists():
-        return [], set()
-    with open(MASTER_JSON) as f:
-        data = json.load(f)
-    return data, {p["id"] for p in data}
-
-
-def save_master(posts_list):
-    sorted_posts = sorted(
-        posts_list,
-        key=lambda p: p.get("createdAtISO", p.get("createdAt", "")),
-        reverse=True,
-    )
-    with open(MASTER_JSON, "w") as f:
-        json.dump(sorted_posts, f, indent=2)
-
-
 def send_telegram(bot_token, chat_id, message):
     if not bot_token or not chat_id:
         return
@@ -87,117 +67,84 @@ def send_telegram(bot_token, chat_id, message):
 # Playwright scraper
 # ---------------------------------------------------------------------------
 
-async def extract_post(container, urn: str) -> dict | None:
-    """Extract structured data from a post container element."""
+def rel_to_iso(rel: str) -> str:
+    """Convert LinkedIn relative timestamp ('4h', '1d', '2w', '1mo', '1yr') to ISO 8601."""
+    import re
+    now = datetime.now(timezone.utc)
+    rel = rel.strip().lower()
+    m = re.match(r"(\d+)\s*(s|m|h|d|w|mo|yr)", rel)
+    if not m:
+        return now.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    n, unit = int(m.group(1)), m.group(2)
+    from datetime import timedelta
+    deltas = {"s": timedelta(seconds=n), "m": timedelta(minutes=n),
+              "h": timedelta(hours=n),   "d": timedelta(days=n),
+              "w": timedelta(weeks=n),   "mo": timedelta(days=n * 30),
+              "yr": timedelta(days=n * 365)}
+    return (now - deltas.get(unit, timedelta(0))).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+
+def parse_post_innertext(raw: str) -> tuple[str, str, str]:
+    """
+    Parse LinkedIn saved-posts inner_text into (author_name, post_text, timestamp_rel).
+
+    The page renders each saved post as:
+        {Author Name}
+        View {Author Name}'s profile
+        • {Degree}
+        {Author Job Title}
+        {relative_time} •
+        {relative_time} Visible to everyone
+        {POST TEXT...}
+    """
+    lines = [l.strip() for l in raw.split("\n") if l.strip()]
+
+    author_name = lines[0] if lines else ""
+
+    post_text = ""
+    timestamp_rel = ""
+    for i, line in enumerate(lines):
+        if "Visible to everyone" in line:
+            # Timestamp is embedded: "4h Visible to everyone"
+            ts = line.replace("Visible to everyone", "").strip().rstrip("•").strip()
+            if ts:
+                timestamp_rel = ts
+            post_text = "\n".join(lines[i + 1:]).strip()
+            break
+
+    return author_name, post_text, timestamp_rel
+
+
+async def extract_post(container) -> dict | None:
+    """Extract a post dict from a [data-chameleon-result-urn] container element."""
     try:
-        # Text content — try selectors in priority order
-        text = ""
-        for sel in [
-            ".feed-shared-text",
-            ".update-components-text",
-            ".feed-shared-update-v2__description",
-            ".feed-shared-article__description",
-            ".update-components-entity__title-text",
-        ]:
-            el = await container.query_selector(sel)
-            if el:
-                text = (await el.inner_text()).strip()
-                if text:
-                    break
-
-        # Author name
-        author_name = ""
-        for sel in [
-            ".update-components-actor__name span[aria-hidden='true']",
-            ".update-components-actor__name",
-            ".feed-shared-actor__name",
-        ]:
-            el = await container.query_selector(sel)
-            if el:
-                author_name = (await el.inner_text()).strip()
-                if author_name:
-                    break
-
-        # Author profile URL
-        author_url = ""
-        for sel in [
-            ".update-components-actor__meta-link",
-            ".feed-shared-actor__container-link",
-            "a.app-aware-link[href*='/in/']",
-            "a.app-aware-link[href*='/company/']",
-        ]:
-            el = await container.query_selector(sel)
-            if el:
-                href = await el.get_attribute("href") or ""
-                if "/in/" in href or "/company/" in href:
-                    author_url = href.split("?")[0]
-                    break
-
-        # Reactions count
-        likes = 0
-        for sel in [
-            ".social-details-social-counts__reactions-count",
-            "button[aria-label*='reaction'] span",
-            ".social-counts-reactions span",
-        ]:
-            el = await container.query_selector(sel)
-            if el:
-                raw = (await el.inner_text()).strip().replace(",", "")
-                try:
-                    likes = int(raw)
-                except ValueError:
-                    pass
-                break
-
-        # Comments count
-        comments = 0
-        for sel in [
-            ".social-details-social-counts__comments-count",
-            "button[aria-label*='comment'] span",
-            ".social-details-social-counts__comments a",
-        ]:
-            el = await container.query_selector(sel)
-            if el:
-                raw = (await el.inner_text()).strip().replace(",", "").split()[0]
-                try:
-                    comments = int(raw)
-                except ValueError:
-                    pass
-                break
-
-        # Timestamp — LinkedIn shows relative times; prefer datetime attribute
-        created_at_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
-        for sel in [
-            ".update-components-actor__sub-description time",
-            ".feed-shared-actor__sub-description time",
-            "time[datetime]",
-        ]:
-            el = await container.query_selector(sel)
-            if el:
-                dt_attr = await el.get_attribute("datetime")
-                if dt_attr:
-                    created_at_iso = dt_attr
-                break
-
-        # Skip containers with no useful content (profile cards, ads)
-        if not text and not author_name:
+        urn = await container.get_attribute("data-chameleon-result-urn") or ""
+        if not urn:
             return None
 
-        post_url = f"https://www.linkedin.com/feed/update/{urn}/"
+        # All visible text for parsing
+        raw_text = (await container.inner_text()).strip()
+        author_name, post_text, ts_rel = parse_post_innertext(raw_text)
+
+        # Author profile URL (strip LinkedIn tracking params)
+        author_url = ""
+        el = await container.query_selector("a[href*='/in/'], a[href*='/company/']")
+        if el:
+            href = await el.get_attribute("href") or ""
+            author_url = href.split("?")[0]
+
+        if not author_name and not post_text:
+            return None
+
+        created_at_iso = rel_to_iso(ts_rel) if ts_rel else datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
         handle = author_url.rstrip("/").split("/")[-1] if author_url else ""
+        post_url = f"https://www.linkedin.com/feed/update/{urn}/"
 
         return {
             "id": urn,
-            "text": text,
-            "author": {
-                "name": author_name,
-                "handle": handle,
-                "profileUrl": author_url,
-            },
-            "metrics": {
-                "likes": likes,
-                "comments": comments,
-            },
+            "text": post_text,
+            "author": {"name": author_name, "handle": handle, "profileUrl": author_url},
+            "metrics": {"likes": 0, "comments": 0},
             "createdAt": created_at_iso[:10],
             "createdAtISO": created_at_iso,
             "postUrl": post_url,
@@ -205,7 +152,7 @@ async def extract_post(container, urn: str) -> dict | None:
         }
 
     except Exception as e:
-        print(f"[warn] Failed to extract {urn}: {e}", file=sys.stderr)
+        print(f"[warn] extract failed: {e}", file=sys.stderr)
         return None
 
 
@@ -233,7 +180,6 @@ async def scrape_saved_posts(li_at: str, stop_ids: set = None, max_posts: int = 
             viewport={"width": 1280, "height": 900},
         )
 
-        # Inject session cookie — equivalent to being logged into linkedin.com
         await ctx.add_cookies([{
             "name": "li_at",
             "value": li_at,
@@ -247,19 +193,16 @@ async def scrape_saved_posts(li_at: str, stop_ids: set = None, max_posts: int = 
         print("→ Opening LinkedIn saved posts (headless)...")
         await page.goto(SAVED_POSTS_URL, wait_until="domcontentloaded", timeout=30_000)
 
-        # Wait for feed content — bail if page didn't authenticate
+        # Wait for post cards — bail if not authenticated
         try:
-            await page.wait_for_selector(
-                "[data-urn], .scaffold-finite-scroll__content, .feed-shared-update-v2",
-                timeout=20_000,
-            )
+            await page.wait_for_selector("[data-chameleon-result-urn]", timeout=20_000)
         except Exception:
             title = await page.title()
-            print(
-                f"[error] Saved posts page didn't load (page title: '{title}'). "
-                "Check your LINKEDIN_LI_AT cookie — it may have expired.",
-                file=sys.stderr,
-            )
+            url = page.url
+            if "login" in url or "authwall" in url or "checkpoint" in url:
+                print("[error] Redirected to login — LINKEDIN_LI_AT cookie is expired.", file=sys.stderr)
+            else:
+                print(f"[error] No post containers found (title: '{title}'). Check cookie.", file=sys.stderr)
             await browser.close()
             return []
 
@@ -268,32 +211,25 @@ async def scrape_saved_posts(li_at: str, stop_ids: set = None, max_posts: int = 
 
         while not stop_early and stale_scrolls < 3 and len(posts) < max_posts:
             scroll_round += 1
-
-            # Extract all visible post containers that have a URN
-            containers = await page.query_selector_all("[data-urn]")
             prev_count = len(posts)
 
-            for container in containers:
-                urn = await container.get_attribute("data-urn") or ""
+            containers = await page.query_selector_all("[data-chameleon-result-urn]")
 
-                # Only process posts (activity/share URNs), skip people/companies
-                if not (urn.startswith("urn:li:activity:") or urn.startswith("urn:li:share:")):
-                    continue
-                if urn in seen_urns:
+            for container in containers:
+                urn = await container.get_attribute("data-chameleon-result-urn") or ""
+                if not urn or urn in seen_urns:
                     continue
                 seen_urns.add(urn)
 
-                # Incremental stop: hit a post we already have → done
                 if stop_ids and urn in stop_ids:
-                    print(f"  Hit known post {urn} — stopping scroll.")
+                    print(f"  Hit known post — stopping scroll.")
                     stop_early = True
                     break
 
-                post = await extract_post(container, urn)
+                post = await extract_post(container)
                 if post:
                     posts.append(post)
 
-            # Scroll down and wait for new content
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(2500)
 
@@ -327,8 +263,12 @@ def sync(full: bool = False):
     telegram_chat  = os.environ.get("TELEGRAM_CHAT_ID", "")
     today = date.today().isoformat()
 
-    existing_list, existing_ids = load_master()
-    print(f"Loaded {len(existing_list)} existing LinkedIn saved posts.")
+    from db import get_conn, import_linkedin
+    db_conn = get_conn()
+    existing_ids = {row[0] for row in db_conn.execute(
+        "SELECT id FROM bookmarks WHERE source='linkedin'"
+    ).fetchall()}
+    print(f"Loaded {len(existing_ids)} existing LinkedIn saved posts from DB.")
 
     max_posts = FULL_MAX if full else DAILY_MAX
     stop_ids  = None if full else existing_ids   # don't stop early on --full
@@ -351,18 +291,12 @@ def sync(full: bool = False):
         send_telegram(telegram_token, telegram_chat, msg)
         return
 
-    merged = existing_list + new_posts
-    save_master(merged)
-    print(f"Saved {len(new_posts)} new posts → {MASTER_JSON}")
+    import_linkedin(db_conn, new_posts, verbose=True)
+    db_conn.close()
 
-    # Import → enrich → cluster (same pipeline as Twitter)
+    # Enrich → cluster (same pipeline as Twitter)
     cluster_stats = {}
     try:
-        from db import get_conn, import_linkedin
-        db_conn = get_conn()
-        import_linkedin(db_conn, new_posts, verbose=True)
-        db_conn.close()
-
         from enrich import enrich_new
         enrich_new(new_ids=[p["id"] for p in new_posts], verbose=True)
 
@@ -375,7 +309,7 @@ def sync(full: bool = False):
     # Telegram notification
     lines = [
         f"✅ x-signals LinkedIn: +{len(new_posts)} new saved posts "
-        f"(total: {len(merged)}) — {today}"
+        f"(total: {len(existing_ids) + len(new_posts)}) — {today}"
     ]
     if cluster_stats:
         assigned   = cluster_stats.get("assigned", 0)

@@ -324,8 +324,9 @@ def generate_labels(clusters_data, skip=False):
         batch = clusters_data[batch_start: batch_start + LABEL_BATCH]
 
         prompt = (
-            "You are labelling discourse clusters from a legal/policy analyst's Twitter bookmarks "
-            "(crypto regulation, AI governance, digital assets, legal profession transformation).\n\n"
+            "You are labelling discourse clusters from a legal/policy analyst's saved content "
+            "(Twitter bookmarks and LinkedIn saved posts). Topics span: crypto regulation, AI governance, "
+            "digital assets, legal profession transformation, vibe coding / AI tools for lawyers.\n\n"
             "For each cluster below, produce a JSON object with:\n"
             '  "title": 5-8 word descriptive headline (not a question)\n'
             '  "description": 2 sentences — what this cluster is about and why it matters\n'
