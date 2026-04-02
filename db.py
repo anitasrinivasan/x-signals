@@ -208,6 +208,37 @@ def import_from_json(conn=None, json_path=None, verbose=True):
     return inserted
 
 
+def import_twitter(conn, tweets: list, verbose=False):
+    """Import a list of Twitter tweet dicts directly into the bookmarks table."""
+    inserted = 0
+    skipped = 0
+    for t in tweets:
+        row = tweet_to_row(t)
+        if not row["id"]:
+            continue
+        try:
+            conn.execute(
+                """INSERT OR IGNORE INTO bookmarks
+                   (id, author_handle, author_name, author_verified, text,
+                    quoted_tweet_id, quoted_tweet_text, urls, media_types,
+                    likes, views, created_at, source)
+                   VALUES (:id, :author_handle, :author_name, :author_verified, :text,
+                           :quoted_tweet_id, :quoted_tweet_text, :urls, :media_types,
+                           :likes, :views, :created_at, 'twitter')""",
+                row,
+            )
+            if conn.execute("SELECT changes()").fetchone()[0]:
+                inserted += 1
+            else:
+                skipped += 1
+        except Exception as e:
+            print(f"[warn] Failed to insert {row['id']}: {e}", file=sys.stderr)
+    conn.commit()
+    if verbose:
+        print(f"Twitter: imported {inserted} new posts, skipped {skipped} existing.")
+    return inserted
+
+
 def import_linkedin(conn, posts: list, verbose=True):
     """Import a list of LinkedIn saved post dicts into the bookmarks table."""
     inserted = 0

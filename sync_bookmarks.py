@@ -23,7 +23,6 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR = Path(__file__).parent
-MASTER_JSON = SCRIPT_DIR / "twitter_bookmarks.json"
 DAILY_BATCH = 500
 FULL_BATCH = 5000
 
@@ -73,26 +72,6 @@ def send_telegram(bot_token, chat_id, message):
 # Bookmark sync
 # ---------------------------------------------------------------------------
 
-def load_master():
-    """Load master JSON, return (list_of_dicts, set_of_ids)."""
-    if not MASTER_JSON.exists():
-        return [], set()
-    with open(MASTER_JSON) as f:
-        data = json.load(f)
-    return data, {t["id"] for t in data}
-
-
-def save_master(tweets_list):
-    """Sort by createdAtISO descending and write back to master JSON."""
-    sorted_tweets = sorted(
-        tweets_list,
-        key=lambda t: t.get("createdAtISO", ""),
-        reverse=True,
-    )
-    with open(MASTER_JSON, "w") as f:
-        json.dump(sorted_tweets, f, indent=2)
-
-
 def sync(batch_size):
     load_env()
 
@@ -102,9 +81,13 @@ def sync(batch_size):
     telegram_chat = os.environ.get("TELEGRAM_CHAT_ID", "")
     today = date.today().isoformat()
 
-    # Load existing bookmarks
-    existing_list, existing_ids = load_master()
-    print(f"Loaded {len(existing_list)} existing bookmarks from master JSON.")
+    # Load existing IDs from DB
+    from db import get_conn, import_twitter
+    db_conn = get_conn()
+    existing_ids = {row[0] for row in db_conn.execute(
+        "SELECT id FROM bookmarks WHERE source='twitter'"
+    ).fetchall()}
+    print(f"Loaded {len(existing_ids)} existing Twitter bookmarks from DB.")
 
     # Fetch from Twitter
     print(f"Fetching up to {batch_size} bookmarks from Twitter...")
@@ -156,21 +139,13 @@ def sync(batch_size):
         send_telegram(telegram_token, telegram_chat, msg)
         return
 
-    # Merge and save
-    merged = existing_list + new_dicts
-    save_master(merged)
+    # Import new tweets directly to SQLite, enrich, and cluster
+    import_twitter(db_conn, new_dicts, verbose=True)
+    db_conn.close()
 
-    # Upsert new rows into SQLite, enrich, and cluster
     cluster_stats = {}
     try:
-        from db import get_conn, init_db, import_from_json
         from enrich import enrich_new
-        db_conn = get_conn()
-        if db_conn is None:
-            init_db()
-            db_conn = get_conn()
-        import_from_json(db_conn, verbose=False)
-        db_conn.close()
         enrich_new(new_ids=[d["id"] for d in new_dicts], verbose=True)
         from cluster import cluster_new
         cluster_stats = cluster_new(new_ids=[d["id"] for d in new_dicts]) or {}
@@ -178,7 +153,7 @@ def sync(batch_size):
         print(f"[warn] DB/enrichment step failed: {e}", file=sys.stderr)
 
     # Build Telegram message
-    lines = [f"✅ x-signals: +{len(new_dicts)} new bookmarks (total: {len(merged)}) — {today}"]
+    lines = [f"✅ x-signals: +{len(new_dicts)} new bookmarks (total: {len(existing_ids) + len(new_dicts)}) — {today}"]
     if cluster_stats:
         assigned   = cluster_stats.get("assigned", 0)
         unassigned = cluster_stats.get("unassigned", 0)
