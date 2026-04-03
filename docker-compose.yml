@@ -1,10 +1,11 @@
+# Before running: cp .env.example .env and fill in your credentials
 services:
   x-signals:
     build: .
     ports:
       - "127.0.0.1:8501:8501"  # localhost only — use Tailscale or a reverse proxy for remote access
     volumes:
-      - ./data:/app/data          # SQLite DB and twitter_bookmarks.json
-      - ./pitches:/app/pitches    # Generated pitch files
+      - ./data:/app/data       # SQLite DB and logs
+      - ./pitches:/app/pitches # Generated pitch files
     env_file: .env
     restart: unless-stopped

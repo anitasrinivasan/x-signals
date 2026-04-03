@@ -27,7 +27,10 @@ pip install -r requirements.txt -q
 
 # Install Playwright's headless Chromium (needed for LinkedIn sync)
 echo "→ Installing Playwright Chromium (~300MB, one-time)..."
-playwright install chromium --with-deps 2>/dev/null || python3 -m playwright install chromium
+python3 -m playwright install chromium --with-deps || {
+  echo "⚠️  Playwright Chromium install failed. LinkedIn sync will not work."
+  echo "    To fix later: source venv/bin/activate && playwright install chromium"
+}
 
 # .env setup
 if [ ! -f .env ]; then
@@ -72,10 +75,38 @@ fi
 # Ensure .env is always owner-only readable, even if it predates this script
 chmod 600 .env 2>/dev/null || true
 
+# Validate credentials before running the pipeline
+echo ""
+echo "→ Validating credentials..."
+python3 - << 'PYEOF'
+import os, sys
+env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+for line in open(env_path):
+    line = line.strip()
+    if line and not line.startswith("#") and "=" in line:
+        k, _, v = line.partition("=")
+        os.environ[k.strip()] = v.strip()
+missing = [k for k in ["ANTHROPIC_API_KEY", "TWITTER_AUTH_TOKEN", "TWITTER_CT0"] if not os.environ.get(k)]
+if missing:
+    print("❌ Missing required credentials: " + ", ".join(missing))
+    print("   Re-run setup.sh or fill in .env manually.")
+    sys.exit(1)
+try:
+    import anthropic
+    anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"]).models.list()
+    print("✅ Anthropic API key valid")
+except Exception as e:
+    print(f"❌ Anthropic API key invalid: {e}")
+    sys.exit(1)
+PYEOF
+
 # First-time data pipeline
 echo ""
 echo "→ Running first-time sync (this fetches your bookmarks — may take a few minutes)..."
-python3 sync_bookmarks.py --full
+python3 sync_bookmarks.py --full || {
+  echo "❌ Twitter sync failed. Check your TWITTER_AUTH_TOKEN and TWITTER_CT0 cookies in .env"
+  exit 1
+}
 
 echo "→ Enriching bookmarks with Claude (this may take 2-4 hours for a large corpus)..."
 python3 enrich.py

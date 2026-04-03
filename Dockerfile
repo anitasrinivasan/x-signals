@@ -8,9 +8,10 @@ WORKDIR /app
 # Install system deps: cron for nightly sync, curl for healthcheck
 RUN apt-get update && apt-get install -y cron curl && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies first (cached layer)
+# Install Python dependencies + Playwright Chromium (needed for LinkedIn sync)
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt && \
+    playwright install chromium --with-deps
 
 # Copy app code
 COPY *.py ./

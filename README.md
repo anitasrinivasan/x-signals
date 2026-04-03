@@ -1,5 +1,7 @@
 # x-signals
 
+**Self-hosted, open source.** Bring your own Anthropic API key and Twitter/LinkedIn session cookies. No subscription, no cloud service, no data leaves your machine.
+
 A personal knowledge graph and writing assistant built on your Twitter/X bookmarks and LinkedIn saved posts. Designed for analysts and writers who want to convert their saved content into publications — law review pieces, policy commentary, Substack posts.
 
 The core idea: rather than treating bookmarks as a flat archive to search, x-signals enriches them with structured metadata (topics, subtopics, positions, entities, claims), clusters them into discourse narratives, and lets Claude query the resulting knowledge graph to surface what's worth writing and why now.
@@ -59,9 +61,13 @@ Create `~/.twitter-cli/config.yaml`:
 maxCount: 5000
 ```
 
-And patch the absolute cap (twitter-cli defaults to 500 max):
-```python
-# In your venv: find the installed package and set _ABSOLUTE_MAX_COUNT = 5000
+> The 500-bookmark cap in twitter-cli is patched automatically at runtime — no manual code changes needed.
+
+### Linux system dependencies
+
+On Ubuntu/Debian, install these before running `setup.sh`:
+```bash
+sudo apt-get install libcurl4-openssl-dev
 ```
 
 ---
