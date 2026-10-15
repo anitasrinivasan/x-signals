@@ -21,6 +21,7 @@ Credential:
 import asyncio
 import json
 import os
+import random
 import sys
 import urllib.request
 from datetime import date, datetime, timezone
@@ -156,7 +157,7 @@ async def extract_post(container) -> dict | None:
         return None
 
 
-async def scrape_saved_posts(li_at: str, stop_ids: set = None, max_posts: int = FULL_MAX) -> list:
+async def scrape_saved_posts(li_at: str, stop_ids: set = None, max_posts: int = FULL_MAX, headless: bool = True) -> list:
     """
     Headless Playwright session: inject li_at cookie → navigate → scroll-and-extract.
 
@@ -170,7 +171,10 @@ async def scrape_saved_posts(li_at: str, stop_ids: set = None, max_posts: int = 
     stop_early = False
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
+        browser = await pw.chromium.launch(
+            headless=headless,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
         ctx = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -178,6 +182,12 @@ async def scrape_saved_posts(li_at: str, stop_ids: set = None, max_posts: int = 
                 "Chrome/122.0.0.0 Safari/537.36"
             ),
             viewport={"width": 1280, "height": 900},
+            locale="en-US",
+            timezone_id="America/Los_Angeles",
+        )
+        # Mask the most obvious automation fingerprint before any page script runs
+        await ctx.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         )
 
         await ctx.add_cookies([{
@@ -190,8 +200,11 @@ async def scrape_saved_posts(li_at: str, stop_ids: set = None, max_posts: int = 
         }])
 
         page = await ctx.new_page()
-        print("→ Opening LinkedIn saved posts (headless)...")
+        mode = "headless" if headless else "visible"
+        print(f"→ Opening LinkedIn saved posts ({mode})...")
         await page.goto(SAVED_POSTS_URL, wait_until="domcontentloaded", timeout=30_000)
+        # Settle like a human reading the page before scrolling
+        await page.wait_for_timeout(random.randint(3500, 6000))
 
         # Wait for post cards — bail if not authenticated
         try:
@@ -209,7 +222,7 @@ async def scrape_saved_posts(li_at: str, stop_ids: set = None, max_posts: int = 
         stale_scrolls = 0
         scroll_round = 0
 
-        while not stop_early and stale_scrolls < 3 and len(posts) < max_posts:
+        while not stop_early and stale_scrolls < 5 and len(posts) < max_posts:
             scroll_round += 1
             prev_count = len(posts)
 
@@ -230,12 +243,16 @@ async def scrape_saved_posts(li_at: str, stop_ids: set = None, max_posts: int = 
                 if post:
                     posts.append(post)
 
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await page.wait_for_timeout(2500)
+            # Human-like incremental scroll (several smaller steps) so LinkedIn's
+            # lazy-loader has time to append the next batch of cards.
+            for _ in range(random.randint(3, 5)):
+                await page.mouse.wheel(0, random.randint(600, 1000))
+                await page.wait_for_timeout(random.randint(700, 1400))
+            await page.wait_for_timeout(random.randint(2500, 4500))
 
             if len(posts) == prev_count:
                 stale_scrolls += 1
-                print(f"  Scroll {scroll_round}: no new posts ({stale_scrolls}/3 stale)")
+                print(f"  Scroll {scroll_round}: no new posts ({stale_scrolls}/5 stale)")
             else:
                 stale_scrolls = 0
                 print(f"  Scroll {scroll_round}: {len(posts)} posts so far")
@@ -250,7 +267,7 @@ async def scrape_saved_posts(li_at: str, stop_ids: set = None, max_posts: int = 
 # Sync orchestration
 # ---------------------------------------------------------------------------
 
-def sync(full: bool = False):
+def sync(full: bool = False, headless: bool = True):
     load_env()
 
     li_at = os.environ.get("LINKEDIN_LI_AT", "").strip()
@@ -275,7 +292,7 @@ def sync(full: bool = False):
 
     try:
         scraped = asyncio.run(
-            scrape_saved_posts(li_at, stop_ids=stop_ids, max_posts=max_posts)
+            scrape_saved_posts(li_at, stop_ids=stop_ids, max_posts=max_posts, headless=headless)
         )
     except Exception as e:
         msg = f"⚠️ x-signals LinkedIn: scrape failed — {e} ({today})"
@@ -333,4 +350,7 @@ def sync(full: bool = False):
 
 if __name__ == "__main__":
     full = "--full" in sys.argv
-    sync(full=full)
+    # Default to headless (used by the scheduled job). Pass --headful for a
+    # manual, less-detectable run in a visible browser window.
+    headless = "--headful" not in sys.argv
+    sync(full=full, headless=headless)
