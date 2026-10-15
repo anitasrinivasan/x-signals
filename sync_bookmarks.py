@@ -2,8 +2,8 @@
 """
 Daily Twitter/X bookmark sync for x-signals.
 
-Fetches the latest 500 bookmarks, deduplicates against the master JSON by
-tweet ID, and appends anything new. Sends a Telegram notification on every run.
+Fetches bookmarks newest-first and stops at the first one already in the DB
+(capped at 500, or 5000 with --full). Sends a Telegram notification on every run.
 
 Usage:
     python3 sync_bookmarks.py           # normal daily sync (500 bookmarks)
@@ -72,6 +72,52 @@ def send_telegram(bot_token, chat_id, message):
 # Bookmark sync
 # ---------------------------------------------------------------------------
 
+def fetch_until_known(client, max_count, existing_ids):
+    """Page through bookmarks (newest first), stopping at the first page that
+    contains a bookmark already in the DB. Returns only tweets newer than it."""
+    import random
+    import time
+    from twitter_cli.client import FEATURES, parse_timeline_response, _deep_get
+
+    def get_instructions(data):
+        return (_deep_get(data, "data", "bookmark_timeline", "timeline", "instructions")
+                or _deep_get(data, "data", "bookmark_timeline_v2", "timeline", "instructions"))
+
+    tweets, seen, cursor = [], set(), None
+    while len(tweets) < max_count:
+        variables = {
+            "count": 40,
+            "includePromotedContent": False,
+            "latestControlAvailable": True,
+            "requestContext": "launch",
+        }
+        if cursor:
+            variables["cursor"] = cursor
+        data = client._graphql_get("Bookmarks", variables, FEATURES)
+        page, next_cursor = parse_timeline_response(data, get_instructions)
+
+        hit_known = False
+        for tweet in page:
+            if not tweet.id or tweet.id in seen:
+                continue
+            if tweet.id in existing_ids:
+                hit_known = True
+                break
+            seen.add(tweet.id)
+            tweets.append(tweet)
+
+        print(f"  page: {len(page)} tweets, {len(tweets)} new so far")
+        if hit_known:
+            print("  Reached an already-synced bookmark — stopping.")
+            break
+        if not next_cursor or next_cursor == cursor:
+            break
+        cursor = next_cursor
+        time.sleep(2.5 * random.uniform(0.7, 1.5))
+
+    return tweets[:max_count]
+
+
 def sync(batch_size):
     load_env()
 
@@ -104,7 +150,7 @@ def sync(batch_size):
             ct0=ct0,
             rate_limit_config={"maxCount": batch_size, "requestDelay": 2.5},
         )
-        fetched_tweets = client.fetch_bookmarks(count=batch_size)
+        fetched_tweets = fetch_until_known(client, batch_size, existing_ids)
 
     except Exception as e:
         err = str(e)
